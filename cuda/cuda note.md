@@ -1322,3 +1322,351 @@ __global__ void block_reduce_kernel(float* input, float* output, int N) {
 然后我让第一个 warp 去做求和就好了。为啥要用第一个 warp 而不是分散开，因为 SM 的调度单位是 warp，而且我们用到了 shuffle
 ```
 
+# 2.2 内存访问优化
+
+## K,M,G,T,P
+
+很简单，按 1000 倍一级记：
+
+- `K` = kilo = \(10^3\) = 千
+- `M` = mega = \(10^6\) = 百万
+- `G` = giga = \(10^9\) = 十亿
+- `T` = tera = \(10^{12}\) = 万亿
+- `P` = peta = \(10^{15}\)
+
+所以：
+
+```text
+1 TFLOPS = 10^12 FLOPS
+1 GFLOPS = 10^9 FLOPS
+1 TB/s   = 10^12 Byte/s
+1 GB/s   = 10^9 Byte/s
+```
+
+你这个例子：
+
+```text
+2 TB/s × 0.083 FLOP/Byte
+= 2 × 10^12 × 0.083
+≈ 1.66 × 10^11 FLOP/s
+= 166 GFLOPS
+```
+
+因为：
+
+```text
+10^11 = 100 × 10^9
+```
+
+所以是 `166 G`。
+
+最好记一句：
+
+**K=3，M=6，G=9，T=12，P=15，每次 +3。**
+
+## CUDA 反人类的编号！
+
+对，CUDA 这里确实容易反直觉。
+
+它的编号规则是：
+
+```cpp
+linear_tid =
+    threadIdx.x
+    + threadIdx.y * blockDim.x
+    + threadIdx.z * blockDim.x * blockDim.y;
+```
+
+也就是说 **x 变化最快，其次 y，再其次 z**。
+
+所以对于：
+
+```cpp
+blockDim = (32, 8)
+```
+
+编号是：
+
+```text
+(0,0) -> 0
+(1,0) -> 1
+(2,0) -> 2
+...
+(31,0) -> 31
+
+(0,1) -> 32
+(1,1) -> 33
+...
+```
+
+不是：
+
+```text
+(0,0)
+(0,1)
+(0,2)
+...
+```
+
+你可以把它想成 C/C++ 二维数组的 row-major：
+
+```cpp
+a[y][x]
+```
+
+也是 `x` 这一维在内存里连续变化。
+
+所以对于 `block(32,8)`，**一个 warp 正好就是固定 y，然后 x=0~31。** 这点对理解 coalesced memory access 特别重要。
+
+## matrix transpose
+
+```cpp
+#define TILE_DIM 32
+#define ROW_STRIDE 8
+extern "C" __global__ void solve(const float* A, const float* B, float* C, int N, int M, int K) {
+    __shared__ float tile[TILE_DIM][TILE_DIM+1];
+    // 考虑块内的 (i,j) 取取得 input[j][i] input[j+8][i]...
+    // 那么对于同一条指令，也就是固定的 offset，同一个 warp 对应 j 一样
+    // 所以第一维一样，warp 内只有 i 不一样，但是连续，所以在内存上访问也是连续的
+    // 符合我们 global memory 合并访问的需要
+    // 需要注意，我们需要先得到这个 block 负责的 A 的区间
+    // 对第一维，那么就是每 tile_dim 个对应一个 block
+    int i=threadIdx.x,j=threadIdx.y;
+    int input_row_offset=blockIdx.y*TILE_DIM;
+    int input_col_offset=blockIdx.x*TILE_DIM;
+    int real_row,real_col;
+    for(int offset=0;offset<TILE_DIM;offset+=ROW_STRIDE) {
+        real_row=j+offset+input_row_offset,real_col=i+input_col_offset;
+        if(real_row<N&&real_col<M) {
+            tile[j+offset][i]=A[real_row*M+real_col];
+        }
+    }
+    __syncthreads();
+    // 还是一样 我们负责把 output 的 (j+offset,i) 找到，并且往回填充
+    // 比如原先负责的行是 32~63 列是 0~31
+    // 那么比如 [33][1]->[1][33]
+    // 那么现在我们要填充 output 的位置是行 0~31，列 32~63
+    int output_row_offset=input_col_offset,output_col_offset=input_row_offset;
+    for(int offset=0;offset<TILE_DIM;offset+=ROW_STRIDE) {
+        real_row=j+offset+output_row_offset,real_col=i+output_col_offset;
+        if(real_row<M&&real_col<N) {
+            C[real_row*N+real_col]=tile[i][j+offset];
+        }
+    }
+}
+```
+
+## blockIdx 编号规则
+
+其实 `blockIdx` 的编号规则和 `threadIdx` **几乎完全一样**，只是一个给 block 编号，一个给 thread 编号。
+
+比如你这样定义：
+
+```
+dim3 block(32, 8);
+dim3 grid(3, 2);
+
+kernel<<<grid, block>>>();
+```
+
+![image-20261124175327309](cuda%20note.assets/image-20261124175327309.png)
+
+意味着有 3×2 = 6 个 block，每个 block 有 32×8 = 256 个线程。
+
+每个格子是一个 block，内部都有独立的 256 个线程。
+
+如果想计算 block 的一维编号，也是 x 变化最快：
+
+```
+int block_id = blockIdx.y * gridDim.x + blockIdx.x;
+```
+
+不过，**block 负责哪些数据，是由你自己写代码决定的，不是 CUDA 自动分配的。**
+
+比如我们之前的矩阵转置，每个 block 负责一个 32×32 的数据区域：
+
+```
+int offset_row = blockIdx.y * 32;
+int offset_col = blockIdx.x * 32;
+```
+
+那么：
+
+| blockIdx (x,y) | 负责的行 | 负责的列 让 x 负责列 |
+| -------------- | -------- | -------------------- |
+| (0,0)          | 0\~31    | 0\~31                |
+| (1,0)          | 0\~31    | 32\~63               |
+| (2,0)          | 0\~31    | 64\~95               |
+| (0,1)          | 32\~63   | 0\~31                |
+| (1,1)          | 32\~63   | 32\~63               |
+| (2,1)          | 32\~63   | 64\~95               |
+
+记住三个层级：
+
+- `gridDim`：整个 grid 有多少个 block。
+- `blockIdx`：当前 block 在 grid 里的坐标。
+- `threadIdx`：当前 thread 在 block 里的坐标。
+
+另外，block 的编号顺序不代表实际执行顺序，GPU 可以自行调度。
+
+## [4. 向量化加载](https://caomaolufei.github.io/AIInfraGuide/guides/模块二-cuda编程与算子优化/22-内存访问优化/#4-向量化加载)
+
+### `reinterpret_cast`：换一种方式看同一块内存
+
+假设：
+
+```cpp
+address.s_addr
+```
+
+是一个 4-byte 整数。原来的指针类型是：
+
+```cpp
+const std::uint32_t*
+```
+
+但现在想逐 byte 读取它，所以把地址重新解释成：
+
+```cpp
+const unsigned char*
+```
+
+内存没有发生复制或转换：
+
+```text
+原来：
+[address.s_addr：4 bytes 整体]
+
+reinterpret_cast 后：
+bytes[0] bytes[1] bytes[2] bytes[3]
+```
+
+这正是 `reinterpret_cast` 的典型用途：
+
+```text
+同一块内存
+-> 换一种底层类型观察
+```
+
+C++ 允许通过 `char*`、`unsigned char*` 或 `std::byte*` 查看任意对象的底层 byte representation，所以这里合法。
+
+### [4.1 什么是向量化加载](https://caomaolufei.github.io/AIInfraGuide/guides/模块二-cuda编程与算子优化/22-内存访问优化/#41-什么是向量化加载)
+
+向量化加载指的是用一条指令读取多个连续元素（如 `float4` 一次读 4 个 float，16 Bytes）。好处是：
+
+1. **减少指令数**：4 次 `LDG.32` → 1 次 `LDG.128`
+2. **提高带宽利用率**：单次事务传输更多有效数据
+3. **减少调度开销**：更少的内存指令排队
+
+### [4.2 常用向量类型](https://caomaolufei.github.io/AIInfraGuide/guides/模块二-cuda编程与算子优化/22-内存访问优化/#42-常用向量类型)
+
+| 📊 类型    | 大小     | 等价        |
+| :-------- | :------- | :---------- |
+| `float2`  | 8 Bytes  | 2 个 float  |
+| `float4`  | 16 Bytes | 4 个 float  |
+| `int4`    | 16 Bytes | 4 个 int    |
+| `double2` | 16 Bytes | 2 个 double |
+
+💡 **提示**：GPU 一条 cache line 为 128 Bytes。一个 Warp 的 32 个线程每人加载一个 `float4`（16B）= 512B，需要请求 4 条 cache line。对比每人加载一个 `float`（4B）= 128B 只需 1 条 cache line。虽然 cache line 请求数增多了，但每条加载指令处理的数据量是 4 倍，总指令数减少 75%。
+
+### [4.3 基本用法](https://caomaolufei.github.io/AIInfraGuide/guides/模块二-cuda编程与算子优化/22-内存访问优化/#43-基本用法)
+
+```cpp
+// 标量版本：每个线程加载 1 个 float
+__global__ void scalar_copy(float* dst, float* src, int N) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid < N) {
+        dst[tid] = src[tid];
+    }
+}
+
+// 向量化版本：每个线程加载 4 个 float
+__global__ void vectorized_copy(float* dst, float* src, int N) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int idx = tid * 4;  // 每个线程负责4个元素
+
+    if (idx + 3 < N) {
+        // 就是换个视角看这片内存，我们把 src 指向的内存用 float4* 的视角去看，这样它走一步是移动了 float4 的
+        // reinterpret_cast<float4*>(src) 也就是这个指针是 float4* 类型的
+        float4 val = reinterpret_cast<float4*>(src)[tid];
+        reinterpret_cast<float4*>(dst)[tid] = val;
+    }
+}
+```
+
+### [4.4 对齐要求](https://caomaolufei.github.io/AIInfraGuide/guides/模块二-cuda编程与算子优化/22-内存访问优化/#44-对齐要求)
+
+向量化加载有严格的对齐要求：
+
+```cpp
+// float4 要求 16B 对齐
+// cudaMalloc 分配的地址是 256B 对齐的 → 满足
+
+// 但如果有偏移，需要特殊处理
+float* base = ...; // 256B 对齐
+float* offset_ptr = base + 3;  // 偏移 12B，不满足 16B 对齐
+
+// ✅ 安全做法：先标量处理头部未对齐部分，再向量化处理主体
+__global__ void safe_vectorized(float* data, int offset, int N) {
+    // 处理头部未对齐的元素
+    int align_offset = (4 - (offset % 4)) % 4;
+    // ... 标量处理前 align_offset 个元素
+
+    // 主体向量化处理
+    float4* aligned_ptr = reinterpret_cast<float4*>(data + offset + align_offset);
+    // ...
+}
+Copy
+```
+
+## memory bound 优化思路
+
+```text
+Kernel 慢
+↓
+它是不是 Memory-Bound？
+│
+├── 不是
+│     ↓
+│   看计算
+│
+└── 是
+      ↓
+检查 Global Memory
+      ↓
+是否 Coalesced？
+│
+├── 否
+│     ↓
+│   改 Thread → Data Mapping
+│   改 Data Layout
+│   AoS → SoA
+│
+└── 是
+      ↓
+有没有 Shared Memory？
+      ↓
+有没有 Bank Conflict？
+│
+├── 有
+│     ↓
+│   Padding / Swizzle
+│
+└── 没有
+      ↓
+能不能 Vectorized Load？
+      ↓
+float4 / int4
+      ↓
+是否已经接近 Bandwidth Peak？
+│
+├── 是
+│     ↓
+│   基本优化完成
+│
+└── 否
+      ↓
+减少冗余访问
+增加 Data Reuse
+```
+
