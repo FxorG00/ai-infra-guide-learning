@@ -1825,3 +1825,288 @@ Block 大小同时受两个限制：
 | Block 大小限制 | block size 太小，导致 block 数量多，但是可能被”每 SM 最大 Block 数”限制 |
 | 非越高越好     | Compute-bound Kernel 中低 Occupancy + 高数据复用可能性能更优 |
 | 调优方法       | Nsight Compute 定位瓶颈 → 针对性调整 → 实测验证              |
+
+# 2.4 同步与原子操作
+
+## memory fence
+
+**Memory Fence（内存栅栏）的核心作用就两个：定顺序、刷缓存。** 它保证在**“栅栏”之前执行的内存写入**，一定会在“栅栏”之后的代码执行前，真正**对目标范围内的其他线程可见**。
+
+> 至于目标范围怎么定，看调用哪一个。
+>
+> ```cpp
+> // Block 级：确保写入对同一 Block 内的线程可见
+> __threadfence_block();
+> 
+> // Device 级：确保写入对同一 GPU 上所有线程可见
+> __threadfence();
+> 
+> // System 级：确保写入对系统内所有设备（包括 CPU、其他 GPU）可见
+> __threadfence_system();
+> 
+> ```
+>
+> 
+
+### 为什么需要它？看一个经典场景
+
+假设线程 A 算完一个数，放进 `data`，然后把 `flag` 改成 `1`，通知线程 B 来取：
+
+C++
+
+```cpp
+// 线程 A（发数据）
+data = 42;            // 1. 写入计算结果
+__threadfence();      // <--- 内存栅栏
+flag = 1;             // 2. 举旗子通知线程 B
+
+// 线程 B（等数据）
+while (flag == 0);    // 死等旗子举起来
+int res = data;       // 读取结果
+```
+
+如果没有中间那行 `__threadfence()`，线程 B 很可能读到错的旧数据，原因有两个：
+
+- **指令重排**：编译器或 GPU 硬件为了优化速度，可能会把 `flag = 1` 挪到 `data = 42` 前面执行。
+- **缓存延迟**：线程 A 写的 `data = 42` 可能还停留在它的局部缓存或写缓冲区里没来得及同步出去，而 `flag = 1` 却先一步被线程 B 看到了。
+
+加上 Fence 之后，就像在代码中间立了一道**单向闸门**：线程 A 执行到这里会停顿一下，确保闸门前的所有写入（`data = 42`）都彻底同步到了其他线程能看见的地方，才允许执行后面的 `flag = 1`。
+
+## atomicCAS 实现其他的原子操作
+
+```cpp
+// atomicCAS 语义：
+// old = *addr;
+// if (old == compare) *addr = val;
+// return old;
+
+// 用 CAS 实现 atomicAdd for double（旧架构不直接支持 double atomicAdd）
+__device__ double atomicAddDouble(double* addr, double val) {
+    unsigned long long int* addr_as_ull = (unsigned long long int*)addr;
+    unsigned long long int old = *addr_as_ull;
+    unsigned long long int assumed;
+
+    do {
+        assumed = old;
+        old = atomicCAS(addr_as_ull, assumed,
+                       __double_as_longlong(
+                           __longlong_as_double(assumed) + val));
+    } while (assumed != old);
+    // CAS 失败意味着其他线程修改了值，需要重试
+
+    return __longlong_as_double(old);
+}
+
+```
+
+这两张图分别讲了两件事：**原子操作为什么会慢（5.3）**，以及**怎么用最底层的 `atomicCAS` 自己造原子操作（5.4）**。
+
+---
+
+## 一、5.3 原子操作的性能代价：本质就是“排队”
+
+原子操作的特点是“同一时间只允许一个线程改同一个内存地址”，你可以把它想象成**上只有一个坑位的厕所**。快不快，全看有多少人同时抢同一个坑位：
+
+* **大家改不同地址**：每人一个坑位，不用排队，速度和普通读写差不多。
+* **同一 Warp 内抢同一个地址**：一个 Warp 有 32 个线程，本来是齐头并进的，现在被迫排成一列一个个进（串行化），最差会慢 32 倍。
+* **跨 Block 大量线程抢同一个地址**：成千上万个线程挤在同一个坑位门口排队，性能直接崩盘，变成严重瓶颈。
+
+至于底下说的延迟数字，是因为“厕所离得远近不同”：
+* **全局内存**在芯片外面或远端（L2 / DRAM），跑一趟要花 **400~600 个时钟周期**。
+* **共享内存**就在计算单元（SM）内部，离得近，跑一趟只要 **20~100 个时钟周期**。
+
+---
+
+## 二、5.4 `atomicCAS`：万能原子操作
+
+这段代码看着吓人，其实核心逻辑非常简单，拆成两部分看就通了。
+
+### 1. `atomicCAS` 到底在干嘛？
+
+CAS 是 **Compare-And-Swap（比较并交换）** 的缩写。它的语义翻译成人话就是：
+
+> “帮我看一眼地址 `*addr` 里现在的值是不是我以为的 `compare`。**如果是**，说明没人动过它，帮我把它改成新值 `val`；**如果不是**，就别改。不管成没成功，都把刚才看到的旧值 `old` 返回给我。”
+
+### 2. 下面那段 `atomicAddDouble` 代码为什么写得那么绕？
+
+旧版 GPU 硬件没有直接提供 `double` 类型的原子加法，但提供了 `atomicCAS`，所以程序员得自己用 CAS 拼一个出来。代码里有两个让人眼花的地方：
+
+**第一，为什么满屏都是 `unsigned long long int`？**
+因为硬件自带的 `atomicCAS` 只认 64 位整数（`unsigned long long int`），不认 `double`。但它们俩占的内存大小一样（都是 64 位），所以代码里做了一堆类型转换（`__double_as_longlong` 等），纯属**“套个整数马甲骗过硬件”**，算加法时再转回 `double`。
+
+**第二，`do ... while` 循环在干嘛？**
+这就是 CAS 的经典套路——**“先猜、再试、被插队就重来”**：
+
+1. **记下旧值**：先把内存里当前的值读出来，存在 `old` 里。
+2. **存为假设值**：`assumed = old;` —— 我假设内存里现在就是这个值。
+3. **算新值并尝试写入**：调用 `atomicCAS`，意思是“如果内存里还是 `assumed`，就帮我写成 `assumed + val`”，同时把内存里**实际**的旧值存回 `old`。
+4. **检查有没有被插队（`while (assumed != old)`）**：
+   * **如果 `assumed == old`**：说明我刚才算加法的时候，没有别的线程插队改过它！写入成功，循环结束。
+   * **如果 `assumed != old`**：坏了，刚才有别的线程抢先改了这个地址！我的写入自动作废，而且 `old` 里现在装的正好是别人刚改完的最新值，于是回到第 2 步，拿这个最新值重新算、重新试，直到成功为止。
+
+这就是为什么说 `atomicCAS` 是“万能”的——只要把第 3 步里的加法换成减法、乘法、取最大值，任何硬件不支持的原子操作都能用这个“试错循环”写出来。
+
+## 几个原子操作优化性能的代码
+
+### 分层规约
+
+```text
+就是先让一个 warp 的 sum 给记到 lane 0 的 val 上面。
+
+然后对于一个 block，我们要求得其所有 warp 的 lane 0 的 val 的和。
+
+那么对一个 block 我开一个 shared memory 上的 block_sum，然后让 val atomicAdd 即可。
+
+然后对于每个 block 的 thread0，我要把这个 block 给 atomicAdd 到全局的 sum。
+```
+
+```cpp
+__global__ void hierarchical_reduce(float* input, float* output, int N) {
+    __shared__ float block_sum;
+    if (threadIdx.x == 0) block_sum = 0.0f;
+    __syncthreads();
+
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    float val = (gid < N) ? input[gid] : 0.0f;
+
+    // 第一层：Warp 内归约（无需原子操作）
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+
+    // 第二层：每个 Warp 的 lane 0 原子加到共享内存
+    // 只有 blockDim.x/32 个线程竞争 → 冲突很小
+    if (threadIdx.x % 32 == 0) {
+        atomicAdd(&block_sum, val);
+    }
+    __syncthreads();
+
+    // 第三层：每个 Block 的 thread 0 原子加到全局结果
+    // 只有 gridDim.x 个线程竞争（远少于总线程数）
+    if (threadIdx.x == 0) {
+        atomicAdd(output, block_sum);
+    }
+}
+
+```
+
+## shared memory 当桶
+
+```text
+这份代码默认，grid 只有 1 维 block，比如 5 个 block；然后一个 block 也是只有 1 维 thread，比如 256 个 thread。
+
+然后我们让每个 thread 负责 data[tid]。但是我们先计数到 block 的 shared_memory 上，再从 shared memory 计数到全局。
+```
+
+
+
+```cpp
+// ❌ 每个线程直接对全局内存做 atomicAdd
+__global__ void histogram_naive(int* data, int* hist, int N) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid < N) {
+        atomicAdd(&hist[data[tid]], 1);  // 全局内存原子，慢
+    }
+}
+
+// ✅ 先在共享内存聚合，再写回全局
+__global__ void histogram_shared(int* data, int* hist, int N, int numBins) {
+    __shared__ int local_hist[256];  // 假设 bin 数 <= 256
+
+    // 初始化局部直方图
+    if (threadIdx.x < numBins) {
+        local_hist[threadIdx.x] = 0;
+    }
+    __syncthreads();
+
+    // 在共享内存上做原子加（快得多）
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid < N) {
+        atomicAdd(&local_hist[data[tid]], 1);
+    }
+    __syncthreads();
+
+    // 将局部结果原子加回全局（只有 numBins 次全局原子操作）
+    if (threadIdx.x < numBins) {
+        atomicAdd(&hist[threadIdx.x], local_hist[threadIdx.x]);
+    }
+}
+
+```
+
+## 每个 thread 维护私有计数器，register
+
+```cpp
+__global__ void privatized_histogram(int* data, int* hist, int N) {
+    // 每个线程维护私有计数器（适用于 bin 数很少的情况）
+    int private_hist[4] = {0, 0, 0, 0};  // 假设只有4个 bin
+
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (int i = tid; i < N; i += stride) {
+        private_hist[data[i]]++;  // 纯寄存器操作，无冲突
+    }
+
+    // 最终写回（大幅减少原子操作次数）
+    for (int bin = 0; bin < 4; bin++) {
+        if (private_hist[bin] > 0) {
+            atomicAdd(&hist[bin], private_hist[bin]);
+        }
+    }
+}
+
+```
+
+## Cooperative Groups
+
+**Cooperative Groups（协作组）本质上是 CUDA 的“自由拉群”工具。** 它把原本死板的线程同步机制包装成了灵活的“线程组对象”，让你既可以**往小了切**（比如只同步 8 个或 16 个线程），也可以**往大了扩**（直接同步整个 GPU 上的所有 Block）。
+
+### 一、它有什么用？（解决了传统 CUDA 的三个痛点）
+
+1. **突破固定粒度**：以前只有两个极端——要么全 Block 一起等（`__syncthreads()`），要么 32 线程的 Warp 一起等（`__syncwarp()`）。现在想按 4 人、8 人、16 人分组同步都行。
+2. **实现官方“全局屏障”**：还记得前面第 4 节截图里说的“GPU 传统上没有全局屏障”吗？Cooperative Groups 直接补上了这块拼图，支持跨所有 Block 的 `grid.sync()`。
+3. **代码更安全、更易复用**：以前调用一个 `__device__` 函数，你根本不知道里面藏没藏同步操作，一不小心放进 `if` 分支就死锁。现在必须把“线程组”当作参数传进去，从接口上就强制规定了哪些线程必须一起参与。
+
+---
+
+### 二、逐段拆解你贴的代码
+
+#### 1. 7.2 常用线程组：怎么“拉群”
+这段代码展示了三种最常用的拉群方式：
+* `cg::this_thread_block()`：把当前整个 Block 拉成一个群，`block.sync()` 就完全等价于传统的 `__syncthreads()`。
+* `cg::tiled_partition<16>(block)`：把当前 Block 均匀切成若干个 16 人的固定小群（Tile）。调用 `tile16.sync()` 时，只同步这 16 个人，完全不管隔壁小组在干嘛。
+* `cg::coalesced_threads()`：只把当前**活跃**的线程临时拉群。比如代码进了某个 `if` 分支，原本 32 个线程只有 10 个满足条件，这个函数就把这 10 个活着的线程凑成一个临时群，避免等待那些没进分支的线程导致卡死。
+
+#### 2. 7.3 协作组归约：对比 6.1 看爽点在哪里
+这段代码做的事和前面 6.1 的 Warp 归约一模一样，只是换成了 Cooperative Groups 的写法：
+* **写法更干净**：6.1 里要手写 `for (int offset = 16; ...)` 和难懂的掩码 `__shfl_down_sync(0xFFFFFFFF, val, offset)`；这里直接用 `warp.size() / 2` 和 `warp.shfl_down(val, offset)`，不用自己操心掩码。
+* **通用性极强**：如果以后需求变了，你想改成每 16 个线程做一次归约，只需把 `<32>` 改成 `<16>`，归约函数内部的逻辑一行都不用动。
+* **换皮属性**：`block.group_index().x`、`block.group_dim().x`、`block.thread_rank()` 其实就是以前 `blockIdx.x`、`blockDim.x`、`threadIdx.x` 的面向对象写法。
+
+#### 3. 7.4 Grid 级同步：全 GPU 集合点名
+这是 Cooperative Groups 最重磅的功能。代码分两阶段：
+1. **第一阶段**：全 GPU 所有线程各自把 `data[gid]` 乘 2。
+2. **`grid.sync()`**：全 GPU 的所有 Block 停下来互相等待，确保第一阶段彻底算完、结果全局可见。
+3. **第二阶段**：安全地去读隔壁位置（可能属于另一个 Block 算出来）的数据。
+
+---
+
+### 三、为什么 7.4 特别警告“可能死锁”？
+
+这是理解 Grid 级同步最关键的一个底层常识：
+
+* **普通启动方式是“分批上场”**：假设你的 GPU 一次最多只能同时装下 100 个 Block，而你启动了 1000 个 Block。平时 GPU 会先跑 100 个，等它们彻底结束腾出位置，再换下一批 100 个上场。
+* **加上 `grid.sync()` 后就会卡死**：如果前 100 个 Block 跑到 `grid.sync()` 停下来，死等后面 900 个 Block 过来集合；但后面 900 个 Block 因为 GPU 没空位根本上不了场——两边互相干等，直接**死锁**。
+
+所以用 `grid.sync()` 必须满足两个硬条件：
+1. 启动时必须换用专门的 `cudaLaunchCooperativeKernel`（不能用普通的 `<<<grid, block>>>`），它会在启动前检查硬件能不能一次性装下所有 Block，装不下直接报错，防止跑起来死锁。
+2. **Grid 大小有上限**：总 Block 数绝对不能超过 GPU 能同时驻留的最大数量。因此如果数据量超大，通常要配合“网格跨步循环（Grid-Stride Loop）”，让有限的常驻 Block 自己循环处理完所有数据。
+
+### 可以直接拿到一维编号
+
+| **写法**              | **含义**                     | **一维情况下等价于**                               |
+| --------------------- | ---------------------------- | -------------------------------------------------- |
+| `tile.thread_rank()`  | 线程在当前 Tile 内的编号     | `threadIdx.x % tile_size`（32 线程时就是 lane ID） |
+| `block.thread_rank()` | 线程在当前 Block 内的编号    | `threadIdx.x`                                      |
+| `grid.thread_rank()`  | 线程在整个 Grid 里的全局编号 | `blockIdx.x * blockDim.x + threadIdx.x`            |
