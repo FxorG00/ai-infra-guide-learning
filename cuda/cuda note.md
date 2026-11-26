@@ -2110,3 +2110,273 @@ __global__ void privatized_histogram(int* data, int* hist, int N) {
 | `tile.thread_rank()`  | 线程在当前 Tile 内的编号     | `threadIdx.x % tile_size`（32 线程时就是 lane ID） |
 | `block.thread_rank()` | 线程在当前 Block 内的编号    | `threadIdx.x`                                      |
 | `grid.thread_rank()`  | 线程在整个 Grid 里的全局编号 | `blockIdx.x * blockDim.x + threadIdx.x`            |
+
+# 性能分析
+
+## 带宽
+
+* **有效带宽（Effective Bandwidth）**
+  * 笔记里写“处理”，换成**“读写（或传输）”**会更准确——“处理”容易和计算吞吐量（FLOPS）混淆，带宽衡量的始终是数据搬运的速度。
+  * **为什么叫“有效”**：它只计算你的算法**真正需要**从显存读入和写出的数据量，不包含因为访存不合并（uncoalesced）等原因被硬件浪费掉的额外传输。
+  * **我要知道，读了多少数据，写了多少。**
+  * 常用计算公式：
+    $$\text{有效带宽} = \frac{\text{读取字节数} (B_r) + \text{写入字节数} (B_w)}{\text{Kernel 执行时间} (t)}$$
+  
+* **理论峰值带宽（Theoretical Peak Bandwidth）**
+  * 你的理解非常到位，就是 GPU 显存硬件规格决定的**最高传输上限**（由显存位宽、显存频率等决定）。
+  * 实际跑程序时几乎不可能达到 100%（一般优化得很好的访存密集型 Kernel 能跑到 80%~90% 就很优秀了）。
+
+在性能分析时，通常就是把这两个数相除（$\frac{\text{有效带宽}}{\text{理论峰值带宽}}$），算出**带宽利用率**，从而判断你的 Kernel 在访存上还有多少优化空间。可以传输这么多数据。
+
+## Nsight Compute
+
+```bash
+ncu \
+    --kernel-name regex:block_reduce_kernel \
+    --launch-skip 5 \
+    --launch-count 1 \
+    ./reduce
+```
+
+### bandwith 与 DRAM throughput 的区别
+
+| **指标名称**                             | **单位** | **统计视角**                            | **核心公式**                                                 |
+| ---------------------------------------- | -------- | --------------------------------------- | ------------------------------------------------------------ |
+| **Effective Bandwidth** （有效带宽）     | `GB/s`   | **算法逻辑视角** （只算真正有用的数据） | `算法必须读写的字节数 ÷ 耗时`                                |
+| **DRAM Throughput** （NCU 里的显存吞吐） | `%`      | **硬件物理视角** （总线实际跑过的全算） | `(显存总线实际流量 ÷ 耗时) ÷ 理论峰值`                       |
+| **带宽利用率** （Bandwidth Utilization） | `%`      | **统称** （分物理和有效两种）           | • 物理利用率 = **DRAM Throughput** • 有效利用率 = `有效带宽 ÷ 理论峰值` |
+
+#### 为什么要区分“物理”和“有效”？用运快递就能懂
+
+假设你有一条公路，每天最多能跑 **100 吨** 货车（理论峰值带宽）。
+
+- **情况一：完美装车（就像你刚才的归约代码）** 货车里装的全是实打实的货物，没有一点浪费。公路上跑了 60 吨货车，你实际收到 60 吨真货。此时 **`有效带宽 ÷ 峰值` ≈ `DRAM Throughput`**（都是 60%）。
+- **情况二：DRAM Throughput 很高（80%），但 Effective Bandwidth 很低（15%）** 这说明货车里 **塞满了没用的泡沫**，公路堵得水泄不通，但你真正收到的货很少。 在 CUDA 里，这几乎一定是非合并访存（Uncoalesced Access）导致的：GPU 每次从显存搬数据有最小粒度（通常是 32 字节），如果你的线程跳着读数组，硬件被迫把一整块 32 字节全搬过来，结果你只用了其中 4 字节，剩下 28 字节全扔了。硬件总线累得半死（`DRAM Throughput` 极高），但算出来的有效带宽惨不忍睹。**GPU 每次从显存搬 32 bytes，有效地却只有 4 bytes；这样看上去 DRAM Throughput 很高，但是很多无用功。**
+- **情况三：Effective Bandwidth 极高（甚至超过显存峰值），但 DRAM Throughput 很低（15%）** 这是**天大的好事**，说明你的数据在 **L1 / L2 缓存里被反复复用了**。 比如算法逻辑上要把同一块数据读 10 遍，结果第 1 遍从大仓库（DRAM）搬来后，后面 9 遍全直接在门卫室（L2 缓存）拿了。大仓库根本没怎么出货（`DRAM Throughput` 很低），但你的业务处理速度飞快（`Effective Bandwidth` 极高）。
+
+### warp state/stall reason
+
+```text
+就是我的 SM 调度 warp，执行一条指令后，warp 进入等待。
+
+NCU 可以统计 warp 等待地原因；这就是 warp stall reasons。
+```
+
+| Stall 类型       | 可以先怎么理解                                      |
+| ---------------- | --------------------------------------------------- |
+| Long Scoreboard  | 等待较长延迟的内存数据依赖                          |
+| Short Scoreboard | 等待较短延迟的数据依赖，例如部分 Shared Memory 操作 |
+| Barrier          | 等待线程同步                                        |
+| Wait             | 等待固定延迟指令的依赖                              |
+| Not Selected     | Warp 已经就绪，但 Scheduler 选择了其他 Warp         |
+
+# reduce
+
+## V0
+
+```cpp
+// V0: 朴素的树形规约（步长从小到大）
+__global__ void reduce_v0(float* input, float* output, int n) {
+    extern __shared__ float smem[];
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // 将全局内存数据加载到共享内存
+    smem[tid] = (gid < n) ? input[gid] : 0.0f;
+    __syncthreads();
+
+    // 树形规约：步长从 1 开始逐步翻倍
+    for (int step = 1; step < blockDim.x; step *= 2) {
+        if (tid % (2 * step) == 0) {
+            smem[tid] += smem[tid + step];
+        }
+        __syncthreads();
+    }
+
+    // 每个 Block 的结果写回全局内存
+    if (tid == 0) {
+        output[blockIdx.x] = smem[0];
+    }
+}
+
+```
+
+![image-20261126235028599](cuda%20note.assets/image-20261126235028599.png)
+
+```text
+第一轮的时候，看成每两个一组。
+
+第二轮，每 4 个一组。
+
+注意，一组的和记在这一轮的左端点，相同编号的 thread id 上。
+
+这样，其实我们每一轮利用到的 thread id 不连续，就会导致一个 warp 出现分化，有的工作有的不工作。
+
+RTX4060 LAPTOP
+Average time: 9.3235 ms
+Effective bandwidth: 57.81 GB/s
+Peak bandwidth: 256.03 GB/s
+Bandwidth utilization: 22.58%
+Result: 134217728
+Expected: 134217728
+Verification: PASSED
+```
+
+## V1
+
+```cpp
+
+```
+
+![image-20261126235345844](cuda%20note.assets/image-20261126235345844.png)
+
+```text
+我们把，这一组的值，存到组编号对应的 thread 上。
+
+比如说，第二轮，0，1，2，3 三组。
+第 i 组让 thread i 去做。
+
+这样，我们每次活跃的 thread 其实都是一段前缀，保证了 thread 编号的连续，自然降低了 warp divergence
+
+那么，我们问题是让第 i 组的和存到 smem 的哪里？
+
+1. 第 i 组存到 smem[i]
+	那么，会有 smem[i]=smem[i*2]+smem[i*2+1]
+	并且要求 RHS 都是旧值，所以需要先拍一个 snapshot 再进行赋值
+2. 第 i 组存到第 i 组的左端点 smem[i*blocksize]
+	那么我们直接合并就好 smem[i*blocksize]+=smem[i*blocksize+blocksize/2]
+	
+RTX4060 LAPTOP
+Average time: 4.6823 ms
+Effective bandwidth: 115.11 GB/s
+Peak bandwidth: 256.03 GB/s
+Bandwidth utilization: 44.96%
+Result: 134217728
+Expected: 134217728
+Verification: PASSED
+```
+
+### V1 的一个性能卡点
+
+```cpp
+if(tid*block_size<blockDim.x)
+不要写除法！
+```
+
+### code
+
+```cpp
+__global__ void block_reduce_kernel_v1_temp(float* input,float* output,int n) {
+    extern __shared__ float smem[];
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    smem[tid] = (gid < n) ? input[gid] : 0.0f;
+    __syncthreads();
+    for(int block_size=2;block_size<=blockDim.x;block_size<<=1) {
+        int temp;
+        if(tid*block_size<blockDim.x) {
+            temp=smem[tid*2]+smem[tid*2+1];
+        }
+        __syncthreads();
+        if(tid*block_size<blockDim.x) {
+            smem[tid]=temp;
+        }
+        __syncthreads();
+    }
+    if(tid==0) {
+        output[blockIdx.x]=smem[0];
+    }
+}
+
+__global__ void block_reduce_kernel_hw_v1_left_end_point(float* input,float* output,int n) {
+    extern __shared__ float smem[];
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    smem[tid] = (gid < n) ? input[gid] : 0.0f;
+    __syncthreads();
+    for(int block_size=2;block_size<=blockDim.x;block_size<<=1) {
+        if(tid*block_size<blockDim.x) {
+            smem[tid*block_size]+=smem[tid*block_size+(block_size>>1)];
+        }
+        __syncthreads();
+    }
+    if(tid==0) {
+        output[blockIdx.x]=smem[0];
+    }
+}
+```
+
+## V2 优化 shared memory 的 bank conflict
+
+考虑对一个 block，我们一开始要求
+$$
+\sum_{i\in[0,step)} smem[i],step=blockDim.x
+$$
+如果，我们想让 step/2，需要干什么呢？
+
+我们只要让 `smem[i]+=smem[i+step/2]`
+
+这样我们比如初始 `step=256`，现在我们只要求 `[0,128)` 的 `smem[i]` 的和了。
+
+同理下去，设一个 `step`，表示我们现在只要求得 `[0,step)` 的和。终点是 `step=1`。
+
+```text
+避免 bank conflict？
+我们考虑一个 warp 访问的 smem
+lane0: i,i+step
+lane1: i+1,i+1+step
+
+也就是 lane 连续，i 连续，那你的 bank 在 mod 32 意义下也是连续，不会有同值的情况，所以不会冲突。
+```
+
+```cpp
+__global__ void block_reduce_kernel_v2_step(float* input,float* output,int n) {
+    extern __shared__ float smem[];
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    smem[tid] = (gid < n) ? input[gid] : 0.0f;
+    __syncthreads();
+    for(int step=blockDim.x/2;step>=1;step>>=1) {
+        if(tid<step) {
+            smem[tid]+=smem[tid+step];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        output[blockIdx.x] = smem[0];
+    }
+}
+```
+
+## V4 如果我现在需要的前缀和，已经在一个 warp 里，我直接 warp reduce
+
+### warp reduce
+
+```text
+其实思想，跟 step 一样。
+维护一个 offset，表示我现在只需要求得 lane[0,offset) 这些的值。
+那么怎么从 offset=32 -> 16?
+其实就是让 lane[0] 对应的 val +=lane[16]
+lane[1]+=lane[17]
+这样 lane[i]+=lane[i+16]。
+我们用到 __shfl_down_sync，效果类似先拍一个 snapshot，带同步语义。
+做完后只需要对 lane[0,16) 求和。
+
+终点:offset=1
+```
+
+```cpp
+__device__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(
+            0xFFFFFFFF, val, offset
+        );
+    }
+
+    return val;
+}
+```
+
