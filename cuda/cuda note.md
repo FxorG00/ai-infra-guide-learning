@@ -2328,6 +2328,15 @@ lane0: i,i+step
 lane1: i+1,i+1+step
 
 也就是 lane 连续，i 连续，那你的 bank 在 mod 32 意义下也是连续，不会有同值的情况，所以不会冲突。
+
+RTX4060 LAPTOP
+Average time: 4.8474 ms
+Effective bandwidth: 111.19 GB/s
+Peak bandwidth: 256.03 GB/s
+Bandwidth utilization: 43.43%
+Result: 134217728
+Expected: 134217728
+Verification: PASSED
 ```
 
 ```cpp
@@ -2351,7 +2360,68 @@ __global__ void block_reduce_kernel_v2_step(float* input,float* output,int n) {
 }
 ```
 
+## V3 让一个 thread 搬两个元素
+
+```text
+考虑一个 block，实际搬运 blockDim.x*2 个元素。
+
+那么一个是 gid=blockIdx.x*blockDim.x*2+threadIdx.x
+一个是 gid+blockDim.x
+
+我现在实际搬运的元素，是我的块大小的两倍。
+
+也就是，我的 block 数量只取
+ceil(n,blockDim.x*2)。
+
+比如 n=256，那么我只需要 1 个 block，128 个 thread
+每个 thread i，负责搬运 i,i+128 这两个数据。
+
+RTX4060 LAPTOP
+Average time: 3.3637 ms
+Effective bandwidth: 159.92 GB/s
+Peak bandwidth: 256.03 GB/s
+Bandwidth utilization: 62.46%
+Result: 134217728
+Expected: 134217728
+Verification: PASSED
+```
+
+```cpp
+__global__ void block_reduce_kernel_v3_one_thread_carry_two_elem(float* input,float* output,int n) {
+    extern __shared__ float smem[];
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x*2 + threadIdx.x;
+
+    if(gid<n) smem[tid]=input[gid];
+    if(gid+blockDim.x<n) smem[tid]+=input[gid+blockDim.x];
+    __syncthreads();
+    for(int step=blockDim.x/2;step>=1;step>>=1) {
+        if(tid<step) {
+            smem[tid]+=smem[tid+step];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        output[blockIdx.x] = smem[0];
+    }
+}
+
+```
+
+
+
 ## V4 如果我现在需要的前缀和，已经在一个 warp 里，我直接 warp reduce
+
+### V4 思想
+
+```text
+后续 step<=32 的时候，我只需要求得 smem[0,step) 的和，然后 thread[0,step) 都是在同一个 warp
+
+所以我当 step=32 的时候，直接 warp_reduce
+```
+
+
 
 ### warp reduce
 
@@ -2366,6 +2436,15 @@ lane[1]+=lane[17]
 做完后只需要对 lane[0,16) 求和。
 
 终点:offset=1
+
+RTX4060 LAPTOP
+Average time: 2.9966 ms
+Effective bandwidth: 179.51 GB/s
+Peak bandwidth: 256.03 GB/s
+Bandwidth utilization: 70.11%
+Result: 134217728
+Expected: 134217728
+Verification: PASSED
 ```
 
 ```cpp
@@ -2378,5 +2457,329 @@ __device__ float warp_reduce_sum(float val) {
 
     return val;
 }
+__global__ void block_reduce_kernel_v4_warp_reduce(float* input,float* output,int n) {
+    extern __shared__ float smem[];
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x*2 + threadIdx.x;
+
+    if(gid<n) smem[tid]=input[gid];
+    if(gid+blockDim.x<n) smem[tid]+=input[gid+blockDim.x];
+    __syncthreads();
+    for(int step=blockDim.x/2;step>=32;step>>=1) {
+        if(tid<step) {
+            smem[tid]+=smem[tid+step];
+        }
+        __syncthreads();
+    }
+    // 现在只需要处理 [0,32) 的 smem 和
+    // 我让 tid[0,32) 去处理
+    if(tid<32) {
+        smem[tid]=warp_reduce_sum(smem[tid]);
+    }
+    if (tid == 0) {
+        output[blockIdx.x] = smem[0];
+    }
+}
+```
+
+## 我们不能认为一个 warp 的 thread 永远同步！
+
+其中：
+
+```cpp
+volatile float* smem
+```
+
+主要用于限制编译器对这些内存访问进行某些优化，例如将读取长期保留在 Register 中。
+
+但是：
+
+> volatile 并不等于同步，也不提供线程间的 Barrier。
+
+Volta 及之后的 GPU 引入了 Independent Thread Scheduling。
+
+因此，不能把 Warp 内线程永远严格同步作为正确性的保证。
+
+## V5 循环展开
+
+```cpp
+for(int step=blockDim.x/2;step>=32;step>>=1) {
+        if(tid<step) {
+            smem[tid]+=smem[tid+step];
+        }
+        __syncthreads();
+    }
+```
+
+### 利用模板、static_assert, if constexpr
+
+```cpp
+static_assert(
+        BLOCK_SIZE == 64 ||
+        BLOCK_SIZE == 128 ||
+        BLOCK_SIZE == 256 ||
+        BLOCK_SIZE == 512 ||
+        BLOCK_SIZE == 1024
+    );
+```
+
+
+
+对，`static_assert`**&#x20;是编译期断言，而不是运行时断言。**
+
+比如：
+
+```cpp
+reduce_v5<256><<<grid, 256>>>(input, output, N);
+```
+
+编译通过。
+
+但如果写：
+
+```cpp
+reduce_v5<100><<<grid, 100>>>(input, output, N);
+```
+
+**编译时就会报错**，根本不会生成对应的可执行代码。
+
+区别：
+
+|       | `static_assert` | `assert`  |
+| ----- | --------------- | --------- |
+| 检查时机  | 编译期             | 运行期       |
+| 条件    | 必须是编译期常量表达式     | 可以是运行时表达式 |
+| 失败结果  | 编译失败            | 程序运行时触发断言 |
+| 运行时开销 | 无               | 可能有       |
+
+这里的 `BLOCK_SIZE` 是模板参数，编译期就已经确定了，所以可以使用 `static_assert`。
+
+同理，下面的 `if constexpr` 也是**编译期进行条件判断**，不满足条件的分支会被直接丢弃，不需要 GPU 在运行时再判断。
+
+### template 的模板实参必须满足编译期常量的要求
+
+```cpp
+int block_size;
+reduce<block_size><<<>>>
+你这样就会失败，因为不能传个变量进去。
+    
+所以我们需要 constexpr，让 block_size 是个编译期常量。
+```
+
+### 为啥子？
+
+```text
+因为，在 complie 阶段，complier 会根据需要，去实例化 reduce<block_size>，但是如果你是个不确定的值，那就没办法实例化成功。
+
+如果是个常量。
+那么就会看到 reduce<BLOCKSIZE> template definition
+然后将比如 256 代入
+然后生成这个具体版本的 code
+然后运行的时候调用这个版本
+```
+
+### V5 code
+
+```cpp
+template<int BLOCKSIZE>
+__global__ void block_reduce_kernel_v4_loop_unrolling(float* input,float* output,int n) {
+    static_assert(BLOCKSIZE==512||BLOCKSIZE==1024||BLOCKSIZE==256||BLOCKSIZE==128);
+    extern __shared__ float smem[BLOCKSIZE];
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x*2 + threadIdx.x;
+
+    smem[tid]=gid<n?input[gid]:0.0f;
+    if(gid+blockDim.x<n) smem[tid]+=input[gid+blockDim.x];
+    __syncthreads();
+    if constexpr(BLOCKSIZE>=2*512) {
+        if(tid<512) smem[tid]+=smem[tid+512];
+    }
+    __syncthreads();
+    if constexpr(BLOCKSIZE>=2*256) {
+        if(tid<256) smem[tid]+=smem[tid+256];
+    }
+    __syncthreads();
+    if constexpr(BLOCKSIZE>=2*128) {
+        if(tid<128) smem[tid]+=smem[tid+128];
+    }
+    __syncthreads();
+    if constexpr(BLOCKSIZE>=2*64) {
+        if(tid<64) smem[tid]+=smem[tid+64];
+    }
+    __syncthreads();
+    if constexpr(BLOCKSIZE>=2*32) {
+        if(tid<32) smem[tid]+=smem[tid+32];
+    }
+    __syncthreads();
+    // 现在只需要处理 [0,32) 的 smem 和
+    // 我让 tid[0,32) 去处理
+    if(tid<32) {
+        smem[tid]=warp_reduce_sum(smem[tid]);
+    }
+    if (tid == 0) {
+        output[blockIdx.x] = smem[0];
+    }
+}
+```
+
+```text
+RTX4060 LAPTOP
+Average time: 2.6690 ms
+Effective bandwidth: 201.54 GB/s
+Peak bandwidth: 256.03 GB/s
+Bandwidth utilization: 78.72%
+Result: 134217728
+Expected: 134217728
+Verification: PASSED
+```
+
+## V6 用两层 warp reduce
+
+```text
+比如一个 block 有 256 个 thread，我们需要对这 256 个 thread 求和。
+
+那么 256/32=8 个 warp。
+我们先让 8 个 warp 内部自己 reduce，得到 8 个 val 存在 smem。
+接下来对这 8 个 warp 再次进行一个 reduce 即可。
+
+需要注意，warp_reduce 针对的是 32 个 thread，所以没 thread 的地方赋值 0。
+
+RTX4060 LAPTOP
+Average time: 2.7971 ms
+Effective bandwidth: 192.32 GB/s
+Peak bandwidth: 256.03 GB/s
+Bandwidth utilization: 75.11%
+Result: 134217728
+Expected: 134217728
+Verification: PASSED
+```
+
+```cpp
+template<int BLOCKSIZE>
+__global__ void block_reduce_kernel_v6_warp_reduce(float* input,float* output,int n) {
+    __shared__ float warp_sum[32];
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * BLOCKSIZE*2 + threadIdx.x;
+    float val=0.0f;
+    val+=gid<n?input[gid]:0.0f;
+    if(gid+BLOCKSIZE<n) val+=input[gid+BLOCKSIZE];
+    int lane=tid%32,warp_id=tid/32;
+    val=warp_reduce_sum(val);
+    if(lane==0) {
+        warp_sum[warp_id]=val;
+    }
+    __syncthreads();
+    // 让所有的 warp_sum 都完成写入
+    // 然后我对 warp_sum 再进行一次规约
+    // 现在，我 warp_reduce 工作的 thread 都是第 0 个 warp 的！
+    // 且满足 tid<总 warp 数量
+    if(tid<32) {
+        val=tid*32<BLOCKSIZE?warp_sum[tid]:0.0f;
+        val=warp_reduce_sum(val);
+        if(tid==0) output[blockIdx.x]=val;
+    }
+}
+```
+
+## V7 增加 Grid Stride Loop,向量化加载 float4
+
+### Grid Stride Loop
+
+```text
+就是比如我们总 Thread 数 T=8
+
+那么 Thread0:
+input[0],input[0+8],input[0+8*2]
+
+也就是 Thread i 负责 input[x],x mod T=i；注意 i 是 thread 在所有 thread 中的编号。
+
+那么这样能够减少我们的 block，去处理大量数据。
+
+那我只要规定好 blockDim,gridDim 了之后，一定可以用 for 去拿到所有的 input。
+
+甚至我不需要管 T 与 N 的大小关系，大不了后面的 thread val=0
+```
+
+### float4
+
+```text
+比如原先 N 个元素
+那么我现在看成 N4=N/4 个元素，只不过每个元素是 float4 类型而已。
+
+注意，比如 N=19，那么 N4=4。
+但是还有 16，17，18 这三个元素在尾巴。
+tail_start=N4*4
+if(tail_start+gid<N) 那么还要加上尾巴
+```
+
+### code
+
+```cpp
+template<int BLOCKSIZE>
+__global__ void block_reduce_kernel_v7(float* input,float* output,int n) {
+    __shared__ float warp_sum[32];
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * BLOCKSIZE + threadIdx.x;
+    int stride=gridDim.x*BLOCKSIZE;
+    // grid stride loop 拿到每个 thread 对应管辖的值
+    float val=0.0f;
+    const float4* input_4=reinterpret_cast<float4*>(input);
+    int n4=n/4;
+    float s0=0.0f,s1=0.0f,s2=0.0f,s3=0.0f;
+    for(int i=gid;i<n4;i+=stride) {
+        float4 data=input_4[i];
+        s0+=data.x;
+        s1+=data.y;
+        s2+=data.z;
+        s3+=data.w;
+    }
+    int tail_start=n4*4;
+    if(gid+tail_start<n) val+=input[gid+tail_start];
+    val+=s0+s1+s2+s3;
+    int lane=tid%32,warp_id=tid/32;
+    val=warp_reduce_sum(val);
+    if(lane==0) {
+        warp_sum[warp_id]=val;
+    }
+    __syncthreads();
+    // 让所有的 warp_sum 都完成写入
+    // 然后我对 warp_sum 再进行一次规约
+    // 现在，我 warp_reduce 工作的 thread 都是第 0 个 warp 的！
+    // 且满足 tid<总 warp 数量
+    if(tid<32) {
+        val=tid*32<BLOCKSIZE?warp_sum[tid]:0.0f;
+        val=warp_reduce_sum(val);
+        if(tid==0) output[blockIdx.x]=val;
+    }
+}
+```
+
+```cpp
+int device_id;
+
+    cudaGetDevice(&device_id);
+
+    int num_sms;
+
+    cudaDeviceGetAttribute(
+        &num_sms,
+        cudaDevAttrMultiProcessorCount,
+        device_id
+    );
+    constexpr int block_size = 256;
+    int grid_size = num_sms*6;
+```
+
+```cpp
+RTX4060 LAPTOP
+Average time: 2.6135 ms
+Effective bandwidth: 205.43 GB/s
+Peak bandwidth: 256.03 GB/s
+Bandwidth utilization: 80.23%
+Result: 134217728
+Expected: 134217728
+Verification: PASSED
 ```
 
