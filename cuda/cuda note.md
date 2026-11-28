@@ -2783,3 +2783,448 @@ Expected: 134217728
 Verification: PASSED
 ```
 
+# GEMM
+
+## 性能指标: FP32 utilization
+
+![image-20261128232742326](cuda%20note.assets/image-20261128232742326.png)
+
+## 变量不一定默认 0
+
+对，但是**是否默认初始化为 0，和它是不是 Global Memory 没有直接关系**。
+
+在 CUDA 中：
+
+| 变量类型                         | 是否默认初始化为 0 |
+| ---------------------------- | ---------- |
+| `float val;`                 | 否          |
+| `float accum[8][8];`         | 否          |
+| `__shared__ float smem[32];` | 否          |
+| `cudaMalloc()` 分配的内存         | 否          |
+
+所以你如果要做累加：
+
+```
+float accum[8][8] = {0};
+```
+
+这样就可以把整个二维数组初始化为 0，然后安全地执行：
+
+```
+accum[i][j] += val;
+```
+
+否则，你就是在一个未初始化的值上进行累加，结果是不可靠的。
+
+**养成一个习惯：如果一个变量第一次使用就是&#x20;**`+=`**，一定要检查它是否已经初始化。**
+
+## 加载数据
+
+![img](cuda%20note.assets/920667478e2e62039eb264dc836eee6d.jpeg)
+
+![img](cuda%20note.assets/22c81a8d551ccb9cb33a1eed853f55b0.jpeg)
+
+## block tiling V1
+
+```cpp
+#define BM 128
+#define BN 128
+#define BK 8
+#define BLOCK_SIZE 256
+__global__ void gemm_v2(const float* A,const float* B,float* C,int M,int N,int K) {
+    __shared__ float A_tile[BM][BK],B_tile[BK][BN];
+    int tid=threadIdx.x;
+    int row_offset=BM*blockIdx.y;
+    int col_offset=BN*blockIdx.x;
+    for(int k_offset=0;k_offset<K;k_offset+=BK) {
+        // 取 A tile
+        
+        int row=tid/8,col=tid%8;
+        for(int i=0;i<128;i+=32) {
+            // tid 负责取回 A_tile[row+i][col]
+            // 然后这个是相对顺序，需要加上对应的 offset
+            A_tile[row+i][col]=((row+i+row_offset)<M&&col+k_offset<K)?A[(row+i+row_offset)*K+col+k_offset]:0.0f;
+        }
+        row=tid/32; col=tid%32;
+        for(int i=0;i<128;i+=32) {
+            // tid 负责取回 B_tile[row][col+i]
+            // 也是需要加上对应 offset
+            B_tile[row][col+i]=((row+k_offset)<K&&col+i+col_offset<N)?B[(row+k_offset)*N+col+i+col_offset]:0.0f;
+        }
+        __syncthreads();
+        // 等待这个 block 的所有 thread 都加载完
+        row=tid/16; col=tid%16;
+        // printf("tid: %d, row: %d, col: %d\n",tid,row,col);
+        for(int c_row_offset=0;c_row_offset<128;c_row_offset+=16) {
+            for(int c_col_offset=0;c_col_offset<128;c_col_offset+=16) {
+                // 实际上算的是 C[c_row_offset+row][c_col_offset+col]
+                int real_row=c_row_offset+row+row_offset,real_col=c_col_offset+col+col_offset;
+                if(real_row<M&&real_col<N) {
+                    // 记得清空
+                    if(k_offset==0) C[real_row*N+real_col]=0.0f;
+                    float val=0.0f;
+                    for(int k=0;k<BK;k++) {
+                        val+=A_tile[c_row_offset+row][k]*B_tile[k][c_col_offset+col];
+                    }
+                    C[real_row*N+real_col]+=val;
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+```
+
+```text
+GPU: NVIDIA GeForce RTX 4060 Laptop GPU
+M = 2048, N = 2048, K = 2048
+SM count: 24
+GPU clock: 1890.00 MHz
+Average time: 20.2903 ms
+Performance: 0.8467 TFLOPS
+Peak FP32: 11.6122 TFLOPS
+FP32 utilization: 7.29%
+Max checked error: 0.00002027
+Verification mode: SAMPLED
+Verification: PASSED
+
+但是，我们会写入 K/BK 次 C 的 global memory；这是低效的。
+但是我们一个 thread 负责 8*8 个 C，所以我们可以开 register 存中间结果。
+等到最后写入一次。
+```
+
+## block tiling V2，优化写入 C
+
+```cpp
+#define BM 128
+#define BN 128
+#define BK 8
+#define BLOCK_SIZE 256
+__global__ void gemm_v2(const float* A,const float* B,float* C,int M,int N,int K) {
+    __shared__ float A_tile[BM][BK],B_tile[BK][BN];
+    int tid=threadIdx.x;
+    int row_offset=BM*blockIdx.y;
+    int col_offset=BN*blockIdx.x;
+    float C_result[8][8]={0};
+    int row,col;
+    for(int k_offset=0;k_offset<K;k_offset+=BK) {
+        // 取 A tile
+        
+        row=tid/8,col=tid%8;
+        #pragma unroll
+        for(int i=0;i<128;i+=32) {
+            // tid 负责取回 A_tile[row+i][col]
+            // 然后这个是相对顺序，需要加上对应的 offset
+            A_tile[row+i][col]=((row+i+row_offset)<M&&col+k_offset<K)?A[(row+i+row_offset)*K+col+k_offset]:0.0f;
+        }
+        row=tid/32; col=tid%32;
+        #pragma unroll
+        for(int i=0;i<128;i+=32) {
+            // tid 负责取回 B_tile[row][col+i]
+            // 也是需要加上对应 offset
+            B_tile[row][col+i]=((row+k_offset)<K&&col+i+col_offset<N)?B[(row+k_offset)*N+col+i+col_offset]:0.0f;
+        }
+        __syncthreads();
+        // 等待这个 block 的所有 thread 都加载完
+        row=tid/16; col=tid%16;
+        // printf("tid: %d, row: %d, col: %d\n",tid,row,col);
+        #pragma unroll
+        for(int c_row_offset=0;c_row_offset<128;c_row_offset+=16) {
+            #pragma unroll
+            for(int c_col_offset=0;c_col_offset<128;c_col_offset+=16) {
+                // 实际上算的是 C[c_row_offset+row][c_col_offset+col]
+                int real_row=c_row_offset+row+row_offset,real_col=c_col_offset+col+col_offset;
+                if(real_row<M&&real_col<N) {
+                    #pragma unroll
+                    for(int k=0;k<BK;k++) {
+                        C_result[c_row_offset/16][c_col_offset/16]+=A_tile[c_row_offset+row][k]*B_tile[k][c_col_offset+col];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    row=tid/16; col=tid%16;
+    for(int c_row_offset=0;c_row_offset<128;c_row_offset+=16) {
+        #pragma unroll
+        for(int c_col_offset=0;c_col_offset<128;c_col_offset+=16) {
+            // 实际上算的是 C[c_row_offset+row][c_col_offset+col]
+            int real_row=c_row_offset+row+row_offset,real_col=c_col_offset+col+col_offset;
+            if(real_row<M&&real_col<N) {
+                C[real_row*N+real_col]=C_result[c_row_offset/16][c_col_offset/16];
+            }
+        }
+    }
+}
+```
+
+```text
+GPU: NVIDIA GeForce RTX 4060 Laptop GPU
+M = 2048, N = 2048, K = 2048
+SM count: 24
+GPU clock: 1890.00 MHz
+Average time: 16.4202 ms
+Performance: 1.0463 TFLOPS
+Peak FP32: 11.6122 TFLOPS
+FP32 utilization: 9.01%
+Max checked error: 0.00008484
+Verification mode: SAMPLED
+Verification: PASSED
+```
+
+## thread tiling register
+
+### 优化思路
+
+```cpp
+for(int c_row_offset=0;c_row_offset<128;c_row_offset+=16) {
+            #pragma unroll
+            for(int c_col_offset=0;c_col_offset<128;c_col_offset+=16) {
+                // 实际上算的是 C[c_row_offset+row][c_col_offset+col]
+                int real_row=c_row_offset+row+row_offset,real_col=c_col_offset+col+col_offset;
+                if(real_row<M&&real_col<N) {
+                    #pragma unroll
+                    for(int k=0;k<BK;k++) {
+                        C_result[c_row_offset/16][c_col_offset/16]+=A_tile[c_row_offset+row][k]*B_tile[k][c_col_offset+col];
+                    }
+                }
+            }
+        }
+```
+
+```text
+观察这个代码，我们每次在最内层，我们都要访问一次共享内存里面的 A tile跟 B tile。
+但是你发现在 k固定的情况下，就是如果说我们把这个 k的这个循环挪到最外层，那么它里面需要用到的 A tile其实是只会有八个，需要会用到的 B tile也是只会有八个。
+因为一个 thread负责八个行，八个列。那么也就是说你可以先把要用到的 A tile跟 B tile存到 register里面，再进行运算。
+```
+
+### code
+
+```cpp
+__global__ void gemm_v3(const float* A,const float* B,float* C,int M,int N,int K) {
+    __shared__ float A_tile[BM][BK],B_tile[BK][BN];
+    int tid=threadIdx.x;
+    int row_offset=BM*blockIdx.y;
+    int col_offset=BN*blockIdx.x;
+    float C_result[8][8]={0};
+    int row,col;
+    float A_frag[8],B_frag[8];
+    for(int k_offset=0;k_offset<K;k_offset+=BK) {
+        // 取 A tile
+        
+        row=tid/8,col=tid%8;
+        #pragma unroll
+        for(int i=0;i<128;i+=32) {
+            // tid 负责取回 A_tile[row+i][col]
+            // 然后这个是相对顺序，需要加上对应的 offset
+            A_tile[row+i][col]=((row+i+row_offset)<M&&col+k_offset<K)?A[(row+i+row_offset)*K+col+k_offset]:0.0f;
+        }
+        row=tid/32; col=tid%32;
+        #pragma unroll
+        for(int i=0;i<128;i+=32) {
+            // tid 负责取回 B_tile[row][col+i]
+            // 也是需要加上对应 offset
+            B_tile[row][col+i]=((row+k_offset)<K&&col+i+col_offset<N)?B[(row+k_offset)*N+col+i+col_offset]:0.0f;
+        }
+        __syncthreads();
+        // 等待这个 block 的所有 thread 都加载完
+        row=tid/16; col=tid%16;
+        // printf("tid: %d, row: %d, col: %d\n",tid,row,col);
+        #pragma unroll
+        for(int k=0;k<BK;k++) {
+            #pragma unroll
+            for(int c_row_offset=0;c_row_offset<128;c_row_offset+=16) {
+                // row 0~15,c_row_offset 最大是 112
+                // 所以一定<128
+                A_frag[c_row_offset/16]=A_tile[c_row_offset+row][k];
+            }
+            #pragma unroll
+            for(int c_col_offset=0;c_col_offset<128;c_col_offset+=16) {
+                B_frag[c_col_offset/16]=B_tile[k][c_col_offset+col];
+            }
+            #pragma unroll
+            for(int c_row_offset=0;c_row_offset<128;c_row_offset+=16) {
+                #pragma unroll
+                for(int c_col_offset=0;c_col_offset<128;c_col_offset+=16) {
+                    // 实际上算的是 C[c_row_offset+row][c_col_offset+col]
+                    int real_row=c_row_offset+row+row_offset,real_col=c_col_offset+col+col_offset;
+                    if(real_row<M&&real_col<N) {
+                        C_result[c_row_offset/16][c_col_offset/16]+=A_frag[c_row_offset/16]*B_frag[c_col_offset/16];
+                    }
+                }
+            }
+
+        }
+        __syncthreads();
+    }
+    row=tid/16; col=tid%16;
+    for(int c_row_offset=0;c_row_offset<128;c_row_offset+=16) {
+        #pragma unroll
+        for(int c_col_offset=0;c_col_offset<128;c_col_offset+=16) {
+            // 实际上算的是 C[c_row_offset+row][c_col_offset+col]
+            int real_row=c_row_offset+row+row_offset,real_col=c_col_offset+col+col_offset;
+            if(real_row<M&&real_col<N) {
+                C[real_row*N+real_col]=C_result[c_row_offset/16][c_col_offset/16];
+            }
+        }
+    }
+}
+```
+
+```text
+GPU: NVIDIA GeForce RTX 4060 Laptop GPU
+M = 2048, N = 2048, K = 2048
+SM count: 24
+GPU clock: 1890.00 MHz
+Average time: 4.4495 ms
+Performance: 3.8611 TFLOPS
+Peak FP32: 11.6122 TFLOPS
+FP32 utilization: 33.25%
+Max checked error: 0.00008484
+Verification mode: SAMPLED
+Verification: PASSED
+```
+
+## warp tiling
+
+### 为什么需要 warp tiling
+
+![image-20261128232357742](cuda%20note.assets/image-20261128232357742.png)
+
+```text
+原因就是我们原先 warp 的排布是，我们原先是对于每一个 thread，我们先排列，排满16个列了之后，接着再开下一行。那你这样子的话，我们对于一个 warp 来说，它有32个 thread，它是占满了两行16个列，也就是对应这个 warp 排布里面2乘16的版本。但是它只有两行，所以你对于一个固定的 K 来说，你看同一条指令，这些 warp 它访问的 A是只有两个的，因为你对于一个固定的 K 来说，它们只有两行嘛。但是你对于它有16个 bit，就是因为它会有16列，那你这样合计就是有18个不同的行列。但是如果跟我们改成4乘8的话，就是你一个 warp，32个 thread 去负责一个4乘8，那这样子只会有12个不同的地址。
+```
+
+
+
+### 对比原先
+
+![image-20261128224725627](cuda%20note.assets/image-20261128224725627.png)
+
+### 现在
+
+![image-20261128224740856](cuda%20note.assets/image-20261128224740856.png)
+
+![image-20261128224755389](cuda%20note.assets/image-20261128224755389.png)
+
+![image-20261128224804861](cuda%20note.assets/image-20261128224804861.png)
+
+![image-20261128224815685](cuda%20note.assets/image-20261128224815685.png)
+
+```text
+这里我补充一下，为什么你这个一个的行 stride 是等于4，列 stride 是等于8。因为你的你先一起排开，它是负责一个4乘8的。那你的行 stride 是要让你跳出去这些负责的行。
+
+那你这一行是覆盖的0到3，那你要跳4是对的。反正你这些它行有多少，列有多少，对应的 stride 就有多少，你这样填就好。
+```
+
+![img](cuda%20note.assets/f47ba3b0e4183fb2bdeb89f1051c0152.jpeg)
+
+![img](cuda%20note.assets/a68e6824bfc7ce58172319d19dbc530c.jpeg)
+
+### v4 code
+
+```cpp
+__global__ void gemm_v4(const float* A,const float* B,float* C,int M,int N,int K) {
+    __shared__ float A_tile[BM][BK],B_tile[BK][BN];
+    int tid=threadIdx.x;
+    int row_offset=BM*blockIdx.y;
+    int col_offset=BN*blockIdx.x;
+    float C_result[8][8]={0};
+    int row,col;
+    float A_frag[8],B_frag[8];
+    int lane_id=tid%32,warp_id=tid/32;
+    int warp_row_offset=(int)(warp_id/2)*32,warp_col_offset=(int)(warp_id%2)*64;
+    for(int k_offset=0;k_offset<K;k_offset+=BK) {
+        // 取 A tile
+        // 取数据是不变的
+        row=tid/8,col=tid%8;
+        #pragma unroll
+        for(int i=0;i<128;i+=32) {
+            // tid 负责取回 A_tile[row+i][col]
+            // 然后这个是相对顺序，需要加上对应的 offset
+            A_tile[row+i][col]=((row+i+row_offset)<M&&col+k_offset<K)?A[(row+i+row_offset)*K+col+k_offset]:0.0f;
+        }
+        row=tid/32; col=tid%32;
+        #pragma unroll
+        for(int i=0;i<128;i+=32) {
+            // tid 负责取回 B_tile[row][col+i]
+            // 也是需要加上对应 offset
+            B_tile[row][col+i]=((row+k_offset)<K&&col+i+col_offset<N)?B[(row+k_offset)*N+col+i+col_offset]:0.0f;
+        }
+        __syncthreads();
+        // 等待这个 block 的所有 thread 都加载完
+
+        // printf("tid: %d, row: %d, col: %d\n",tid,row,col);
+        row=lane_id/8; col=lane_id%8;
+        #pragma unroll
+        for(int k=0;k<BK;k++) {
+            #pragma unroll
+            for(int warp_row_step=0;warp_row_step<32;warp_row_step+=4) {
+                // row: 0~3
+                // warp_row_step 最大是 28
+                // 反正不会越界就对了，因为只是对应到 tile 上
+                // 存到第几个行上
+                A_frag[warp_row_step/4]=A_tile[row+warp_row_step+warp_row_offset][k];
+            }
+            #pragma unroll
+            for(int warp_col_step=0;warp_col_step<64;warp_col_step+=8) {
+                B_frag[warp_col_step/8]=B_tile[k][col+warp_col_step+warp_col_offset];
+            }
+            #pragma unroll
+            for(int warp_row_step=0;warp_row_step<32;warp_row_step+=4) {
+                #pragma unroll
+                for(int warp_col_step=0;warp_col_step<64;warp_col_step+=8) {
+                    // 先算在块内的 C 的哪个位置
+                    // 行: row+warp_row_step+warp_row_offset
+                    // 列: col+warp_col_step+warp_col_offset
+                    // 然后转成 real 再加 row_offset,col_offset
+                    // 存到 C_result 的[这是这个 thread 的第几个行][这个 thread 的第几个列]
+                    int real_row=row+warp_row_step+warp_row_offset+row_offset;
+                    int real_col=col+warp_col_step+warp_col_offset+col_offset;
+                    if(real_row<M&&real_col<N) {
+                        C_result[warp_row_step/4][warp_col_step/8]+=A_frag[warp_row_step/4]*B_frag[warp_col_step/8];
+                    }
+                }
+            }
+
+        }
+        __syncthreads();
+    }
+    // 把 C 的结果从 register 加载回 global memory
+    row=lane_id/8; col=lane_id%8;
+    #pragma unroll
+    for(int warp_row_step=0;warp_row_step<32;warp_row_step+=4) {
+        #pragma unroll
+        for(int warp_col_step=0;warp_col_step<64;warp_col_step+=8) {
+            // 先算在块内的 C 的哪个位置
+            // 行: row+warp_row_step+warp_row_offset
+            // 列: col+warp_col_step+warp_col_offset
+            // 然后转成 real 再加 row_offset,col_offset
+            int real_row=row+warp_row_step+warp_row_offset+row_offset;
+            int real_col=col+warp_col_step+warp_col_offset+col_offset;
+            if(real_row<M&&real_col<N) {
+                C[real_row*N+real_col]=C_result[warp_row_step/4][warp_col_step/8];
+            }
+        }
+    }
+}
+```
+
+```text
+GPU: NVIDIA GeForce RTX 4060 Laptop GPU
+M = 2048, N = 2048, K = 2048
+SM count: 24
+GPU clock: 1890.00 MHz
+Average time: 4.6561 ms
+Performance: 3.6897 TFLOPS
+Peak FP32: 11.6122 TFLOPS
+FP32 utilization: 31.77%
+Max checked error: 0.00008484
+Verification mode: SAMPLED
+Verification: PASSED
+```
+
+
+
+## float4 加载
+
